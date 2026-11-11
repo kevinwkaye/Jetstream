@@ -1,5 +1,7 @@
 # Jetstream foot control plan
 
+**Status, 11 November 2026: built in v0.2.** The table below is what shipped, with A and B tap to catch and hold to sustain in Poly and Mono. See the README.
+
 Written 4 November 2026 from a cross-plugin audit. Build it in Jetstream's own thread.
 
 ## What happens today

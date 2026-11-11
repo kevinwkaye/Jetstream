@@ -346,7 +346,6 @@ static float stopDegrees (int i) { return -135.0f + kStopStep * (float) i; }
 VoiceDial::VoiceDial (JetstreamProcessor& p) : proc (p)
 {
     voiceParam = p.apvts.getParameter (ParamIDs::voice);
-    slotParam = p.apvts.getParameter (ParamIDs::presetSlot);
     setMouseCursor (MouseCursor::PointingHandCursor);
 }
 
@@ -362,7 +361,7 @@ void VoiceDial::paint (Graphics& g)
     auto at = [&] (float deg, float r) { const float a = degreesToRadians (deg); return Point<float> (c.x + std::sin (a) * r * s, c.y - std::cos (a) * r * s); };
 
     const int stop = currentStop();
-    const int slot = roundToInt (plainOf (slotParam));
+    const int slot = nowSeconds() < userLitUntil ? userLit : 1; // 0 User A, 2 User B, 1 neither
     const int group = stop <= 3 ? 0 : (stop <= 5 ? 1 : (stop <= 7 ? 2 : 3));
 
     // group arcs round the rim
@@ -408,7 +407,7 @@ void VoiceDial::paint (Graphics& g)
 
     // a dot under a User stop that holds a saved preset
     for (int i = 0; i < 2; ++i)
-        if (proc.hasPresetSlot (i == 0 ? 0 : 2))
+        if (proc.hasUser (i))
         {
             const auto dp = at (stopDegrees (10 + i), 62);
             g.setColour (ff::dim);
@@ -437,11 +436,7 @@ int VoiceDial::stopAt (Point<float> p) const
 void VoiceDial::pick (int stop)
 {
     if (stop < 0) return;
-    if (stop >= 10) // User A / B recall the presets saved on the A and B buttons
-    {
-        const int slot = stop == 10 ? 0 : 2;
-        setParam (slotParam, roundToInt (plainOf (slotParam)) == slot ? 1.0f : (float) slot);
-    }
+    if (stop >= 10) return; // User A and B act on release: tap recalls, hold stores
     else
     {
         setParam (voiceParam, (float) stop);
@@ -451,6 +446,8 @@ void VoiceDial::pick (int stop)
 
 void VoiceDial::mouseDown (const MouseEvent& e)
 {
+    proc.touchPanel();
+    downAt = nowSeconds();
     dragStop = stopAt (e.position);
     dragStart = (float) currentStop();
     pick (dragStop);
@@ -461,10 +458,25 @@ void VoiceDial::mouseDrag (const MouseEvent& e)
     // Drag up or down to step through the voices
     const int stop = jlimit (0, 9, roundToInt (dragStart - (float) e.getDistanceFromDragStartY() / 22.0f));
     if (std::abs (e.getDistanceFromDragStartY()) > 6 && stop != currentStop())
+    {
+        dragStop = -1; // dragging off a User stop doesn't recall it
         pick (stop);
+    }
 }
 
-void VoiceDial::mouseUp (const MouseEvent&) { dragStop = -1; }
+void VoiceDial::mouseUp (const MouseEvent&)
+{
+    if (dragStop >= 10)
+    {
+        const int slot = dragStop - 10;
+        if (nowSeconds() - downAt > 0.8) proc.storeUser (slot);
+        else proc.recallUser (slot);
+        userLit = slot == 0 ? 0 : 2;
+        userLitUntil = nowSeconds() + 2.0;
+        repaint();
+    }
+    dragStop = -1;
+}
 
 void VoiceDial::mouseWheelMove (const MouseEvent&, const MouseWheelDetails& w)
 {
@@ -476,13 +488,12 @@ void VoiceDial::mouseWheelMove (const MouseEvent&, const MouseWheelDetails& w)
 // =====================================================================================
 SamplerButton::SamplerButton (JetstreamProcessor& p, int ch) : proc (p), channel (ch)
 {
-    param = p.apvts.getParameter (ch == 0 ? ParamIDs::footA : ParamIDs::footB);
     setMouseCursor (MouseCursor::PointingHandCursor);
 }
 
-void SamplerButton::set (bool v) { setParam (param, v ? 1.0f : 0.0f); }
-void SamplerButton::mouseDown (const MouseEvent&) { pressed = true; set (true); repaint(); }
-void SamplerButton::mouseUp (const MouseEvent&) { pressed = false; set (false); repaint(); }
+// these are footswitches A and B, so tap and hold do exactly what the real ones do
+void SamplerButton::mouseDown (const MouseEvent&) { pressed = true; proc.footDown (channel); repaint(); }
+void SamplerButton::mouseUp (const MouseEvent&) { pressed = false; proc.footUp (channel); repaint(); }
 
 void SamplerButton::paint (Graphics& g)
 {
@@ -509,7 +520,7 @@ void SamplerButton::paint (Graphics& g)
     g.setColour (ff::ink);
     g.setFont (ff::font (22.0f, 0.08f));
     g.drawText (channel == 0 ? "A" : "B", text.removeFromTop (r.getHeight() * 0.58f).withTrimmedTop (6.0f), Justification::bottomLeft, false);
-    ff::label (g, manual ? (sounding ? "HOLDING" : "TAP TO CAPTURE") : (sounding ? "SOUNDING" : "READY"),
+    ff::label (g, manual ? (sounding ? "HOLDING" : "TAP TO CAPTURE") : (sounding ? "HOLD TO SUSTAIN" : "TAP TO CATCH"),
                text.toNearestInt(), Justification::topLeft, ff::dim, 11.0f);
 }
 
@@ -603,76 +614,344 @@ void LearnButton::paint (Graphics& g)
     g.drawText (text, b.withTrimmedLeft (12.0f), Justification::centred, false);
 }
 
-PresetToggle::PresetToggle (JetstreamProcessor& p) : proc (p)
+// =====================================================================================
+// Preset strip
+// =====================================================================================
+static const String dotChar (CharPointer_UTF8 ("\xc2\xb7"));
+
+static void wrapText (Graphics& g, const String& t, Rectangle<int> r, float h, Colour c, int lines)
 {
-    setMouseCursor (MouseCursor::PointingHandCursor);
+    g.setColour (c);
+    g.setFont (Font (FontOptions (h)));
+    g.drawFittedText (t, r, Justification::topLeft, lines, 1.0f);
 }
 
-Rectangle<float> PresetToggle::cell (int i) const
+PresetStrip::PresetStrip (JetstreamProcessor& p) : proc (p)
 {
-    const float w[3] = { 40.0f, 52.0f, 40.0f };
-    float x = 0;
-    for (int k = 0; k < i; ++k) x += w[k] + 4.0f;
-    return { x, 0.0f, w[i], (float) getHeight() - 8.0f };
+    for (auto* c : std::initializer_list<Component*> { &prev, &next, &card, &save }) addAndMakeVisible (c);
+    prev.set (CharPointer_UTF8 ("\xe2\x97\x80"), {}, fam::col::line);
+    next.set (CharPointer_UTF8 ("\xe2\x96\xb6"), {}, fam::col::line);
+    prev.setTextHeight (12.0f);
+    next.setTextHeight (12.0f);
+    prev.onPress = [this] { proc.touchPanel(); proc.stepPreset (-1); };
+    next.onPress = [this] { proc.touchPanel(); proc.stepPreset (1); };
+    save.onClick = [this] { proc.saveUserPreset(); savedFlash = 1.5f; };
+    startTimerHz (20);
 }
 
-void PresetToggle::paint (Graphics& g)
+void PresetStrip::resized()
 {
-    const int sel = (int) std::lround (proc.apvts.getRawParameterValue (ParamIDs::presetSlot)->load());
-    static const char* labels[3] = { "A", "LIVE", "B" };
-    for (int i = 0; i < 3; ++i)
+    prev.setBounds (0, 4, 34, 32);
+    card.setBounds (40, 0, 250, 40);
+    next.setBounds (296, 4, 34, 32);
+    save.setBounds (338, 4, 58, 32);
+}
+
+void PresetStrip::paint (Graphics&) {}
+
+void PresetStrip::timerCallback()
+{
+    const int pi = proc.currentPreset();
+    card.setText (String (pi + 1).paddedLeft ('0', 2) + " " + proc.presetName (pi) + (proc.presetEdited() ? " *" : ""));
+    save.set (savedFlash > 0.0f ? "SAVED" : "SAVE", savedFlash > 0.0f, 12.0f);
+    if (savedFlash > 0.0f) savedFlash -= 1.0f / 20.0f;
+}
+
+// =====================================================================================
+// Footswitch strip
+// =====================================================================================
+FootStrip::FootStrip (JetstreamProcessor& p, std::function<void()> openPedalPage) : proc (p)
+{
+    for (int i = 0; i < 4; ++i)
     {
-        auto b = cell (i);
-        const bool on = i == sel;
-        const bool flash = i == savedCell && nowSeconds() < savedFlashUntil;
-        g.setColour (flash ? ff::red : (on ? ff::ink : ff::card));
-        g.fillRoundedRectangle (b, 6.0f);
-        g.setColour (Colours::black.withAlpha (on ? 0.3f : 0.85f));
-        g.fillRect (b.getX(), b.getCentreY() - 0.75f, 7.0f, 1.5f);
-        g.fillRect (b.getRight() - 7.0f, b.getCentreY() - 0.75f, 7.0f, 1.5f);
-        g.setColour (on && ! flash ? ff::bg : ff::ink);
-        g.setFont (ff::font (i == 1 ? 13.0f : 15.0f, 0.06f));
-        g.drawText (flash ? "SAVED" : labels[i], b, Justification::centred, false);
+        feet.push_back (std::make_unique<fam::FootButton>());
+        addAndMakeVisible (*feet.back());
+        feet.back()->onPress = [this, i] { proc.footDown (i); };
+        feet.back()->onRelease = [this, i] { proc.footUp (i); };
+    }
+    for (auto* c : std::initializer_list<Component*> { &keeper, &expCard, &expSlider, &pedalLink }) addAndMakeVisible (c);
+    keeper.set ("KEEPER", "HOLD C+D, 1 S", fam::col::green);
+    keeper.setTextHeight (17.0f);
+    keeper.onPress = [this] { proc.touchPanel(); proc.keepNow(); };
+    expSlider.onChange = [this] (float v)
+    {
+        proc.touchPanel();
+        if (proc.get ("expOn") < 0.5f) proc.setPlain ("expOn", 1.0f);
+        proc.setPlain ("exp", v);
+    };
+    pedalLink.text = String (CharPointer_UTF8 ("PEDAL PAGE \xe2\x80\xba"));
+    pedalLink.onClick = std::move (openPedalPage);
+    startTimerHz (30);
+}
 
-        if (i != 1 && proc.hasPresetSlot (i))
+void FootStrip::mouseDown (const MouseEvent&) { proc.touchPanel(); }
+
+void FootStrip::paint (Graphics& g)
+{
+    g.setColour (ff::face);
+    g.fillRoundedRectangle (getLocalBounds().toFloat(), 12.0f);
+    ff::label (g, "FOOTSWITCHES", { 16, 10, 200, 18 });
+    ff::label (g, "TAP A+B " + dotChar + " BYPASS     TAP C+D " + dotChar + " NEXT JETSTREAM", { 220, 10, 400, 18 }, Justification::centredRight, ff::faint, 11.0f);
+    ff::label (g, "EXPRESSION", { 636, 10, 160, 18 });
+    ff::label (g, "HEEL " + proc.expressionRangeText (false) + " " + dotChar + " TOE " + proc.expressionRangeText (true), { 636, 80, 180, 16 }, Justification::centredLeft, ff::dim, 10.0f);
+    if (proc.get ("expOn") < 0.5f) ff::label (g, "NOT MOVED YET", { 636, 118, 180, 16 }, Justification::centredLeft, ff::faint, 10.0f);
+    ff::label (g, "TRY THIS", { 986, 10, 200, 18 }, Justification::centredLeft, ff::teal);
+    wrapText (g, proc.presetHint (proc.currentPreset()), { 986, 34, 218, 70 }, 14.0f, ff::ink, 4);
+}
+
+void FootStrip::resized()
+{
+    for (int i = 0; i < 4; ++i) feet[(size_t) i]->setBounds (16 + i * 152, 34, 144, 100);
+    expCard.setBounds (636, 34, 180, 40);
+    expSlider.setBounds (632, 96, 188, 22);
+    keeper.setBounds (836, 34, 132, 100);
+    pedalLink.setBounds (1070, 112, 134, 18);
+}
+
+void FootStrip::timerCallback()
+{
+    const int down = proc.uiFootDown.load();
+    const bool held = proc.get ("hold") > 0.5f;
+    const auto& eng = proc.getEngine();
+    const bool lit[4] = { eng.uiEnvA.load() > 0.02f, eng.uiEnvB.load() > 0.02f, held, false };
+    const Colour fc[4] = { ff::teal, ff::coral, ff::red, ff::ink };
+    for (int i = 0; i < 4; ++i)
+    {
+        String tap = proc.footJobTap (i);
+        if (i == 2 && held) tap = "MEMORY HELD";
+        feet[(size_t) i]->set (String::charToString ((juce_wchar) ('A' + i)), tap, proc.footJobHold (i), lit[i], fc[i]);
+        feet[(size_t) i]->setDown ((down >> i) & 1);
+    }
+    const int et = jlimit (0, jet::ExpCount - 1, (int) std::lround (proc.get ("expTarget")));
+    expCard.setText (jet::expTargetNames()[(size_t) et]);
+    if (! expSlider.isMouseButtonDown()) expSlider.setValue (proc.uiExp.load());
+    repaint (630, 76, 200, 60);
+    repaint (980, 30, 240, 80);
+}
+
+// =====================================================================================
+// Pedal page
+// =====================================================================================
+PedalPage::PedalPage (JetstreamProcessor& p, std::function<void()> close) : proc (p)
+{
+    setOpaque (true);
+    back.text = String (CharPointer_UTF8 ("\xe2\x80\xb9 BACK TO THE PLUGIN"));
+    back.onClick = std::move (close);
+    for (auto* c : std::initializer_list<Component*> { &back, &expTargetCard, &mapCard, &expSlider, &calButton, &learnExp, &defaults,
+                                                       &exportButton, &mapDown, &mapUp, &learnKeep, &pebble })
+        addAndMakeVisible (c);
+    for (int i = 0; i < 4; ++i)
+    {
+        tapCards.push_back (std::make_unique<fam::FlipCard> (15.0f));
+        holdCards.push_back (std::make_unique<fam::FlipCard> (15.0f));
+        learn.push_back (std::make_unique<fam::BigButton>());
+        addAndMakeVisible (*tapCards.back());
+        addAndMakeVisible (*holdCards.back());
+        addAndMakeVisible (*learn.back());
+        learn.back()->setTextHeight (12.0f);
+        learn.back()->onPress = [this, i] { proc.learnFootswitch (i); };
+    }
+    auto pills = [this] (std::vector<std::unique_ptr<fam::PillButton>>& v, int n)
+    { for (int i = 0; i < n; ++i) { v.push_back (std::make_unique<fam::PillButton>()); addAndMakeVisible (*v.back()); } };
+    pills (targetPills, jet::ExpCount); pills (curvePills, 3); pills (smoothPills, 3); pills (inputPills, 2); pills (keeperPills, 2);
+    for (int i = 0; i < jet::ExpCount; ++i)
+        targetPills[(size_t) i]->onClick = [this, i]
         {
-            g.setColour (ff::dim);
-            g.fillEllipse (b.getCentreX() - 2.0f, b.getBottom() + 3.0f, 4.0f, 4.0f);
-        }
-    }
-}
-
-void PresetToggle::mouseDown (const MouseEvent& e)
-{
-    pressedCell = -1;
+            // a new target starts on its full sweep; each preset keeps its own until you change it
+            if ((int) std::lround (proc.get ("expTarget")) == i) return;
+            proc.setPlain ("expTarget", (float) i);
+            proc.setPlain ("expLo", 0.0f);
+            proc.setPlain ("expHi", 1.0f);
+        };
     for (int i = 0; i < 3; ++i)
-        if (cell (i).contains (e.position)) pressedCell = i;
-    downAt = nowSeconds();
-    saved = false;
-    startTimer (40);
-}
-
-void PresetToggle::timerCallback()
-{
-    if (pressedCell >= 0 && pressedCell != 1 && ! saved && nowSeconds() - downAt > 0.8)
     {
-        proc.savePresetSlot (pressedCell);
-        saved = true;
-        savedCell = pressedCell;
-        savedFlashUntil = nowSeconds() + 0.9;
+        curvePills[(size_t) i]->onClick = [this, i] { proc.pedals().curve = i; proc.saveSettings(); };
+        smoothPills[(size_t) i]->onClick = [this, i] { proc.pedals().expSmooth = i; proc.saveSettings(); };
     }
-    if (pressedCell < 0 && nowSeconds() > savedFlashUntil)
-        stopTimer();
+    inputPills[0]->onClick = [this] { proc.setFootDevice ({}); };
+    inputPills[1]->onClick = [this] { proc.setFootDevice ("none"); };
+    keeperPills[0]->onClick = [this] { proc.setKeeperLive (true); };
+    keeperPills[1]->onClick = [this] { proc.setKeeperLive (false); };
+
+    expSlider.onChange = [this] (float v)
+    {
+        if (proc.get ("expOn") < 0.5f) proc.setPlain ("expOn", 1.0f);
+        proc.setPlain ("exp", v);
+    };
+    calButton.setTextHeight (13.0f);
+    calButton.onPress = [this] { proc.calibrateExpression(); };
+    learnExp.setTextHeight (12.0f);
+    learnExp.onPress = [this] { proc.learnExpression(); };
+    learnKeep.setTextHeight (12.0f);
+    learnKeep.onPress = [this] { proc.learnKeeper(); };
+    defaults.set ("DEFAULTS", {}, fam::col::line);
+    defaults.setTextHeight (12.0f);
+    defaults.onPress = [this] { proc.resetFootswitches(); };
+    exportButton.set ("EXPORT KEEPERS", {}, fam::col::green);
+    exportButton.setTextHeight (13.0f);
+    exportButton.onPress = [this] { proc.exportKeepers(); };
+    mapDown.set (CharPointer_UTF8 ("\xe2\x97\x80"), {}, fam::col::line);
+    mapUp.set (CharPointer_UTF8 ("\xe2\x96\xb6"), {}, fam::col::line);
+    mapDown.setTextHeight (11.0f);
+    mapUp.setTextHeight (11.0f);
+    mapDown.onPress = [this] { proc.setPedalMapChannel ((proc.pedals().pedalMapChannel + 16) % 17); };
+    mapUp.onPress = [this] { proc.setPedalMapChannel ((proc.pedals().pedalMapChannel + 1) % 17); };
+    startTimerHz (20);
+}
+
+void PedalPage::paint (Graphics& g)
+{
+    g.fillAll (ff::bg);
+    g.setColour (ff::ink);
+    g.setFont (ff::font (26.0f, 0.04f));
+    g.drawText ("JETSTREAM", 20, 20, 150, 40, Justification::centredLeft);
+    ff::label (g, "PEDAL PAGE", { 176, 20, 200, 40 });
+
+    for (auto r : { Rectangle<float> (20, 76, 788, 520), { 828, 76, 412, 520 }, { 20, 612, 1220, 168 } })
+    {
+        g.setColour (ff::face);
+        g.fillRoundedRectangle (r, 12.0f);
+    }
+
+    auto& s = proc.pedals();
+    ff::label (g, "FOOTSWITCHES", { 36, 92, 130, 30 });
+    ff::label (g, deviceText, { 166, 92, 520, 30 }, Justification::centredLeft, proc.pedalsDirect() ? ff::teal : ff::dim, 12.0f);
+
+    const int learning = proc.learningWhat();
+    for (int i = 0; i < 4; ++i)
+    {
+        auto r = Rectangle<int> (36 + i * 192, 136, 180, 290);
+        g.setColour (ff::bg);
+        g.fillRoundedRectangle (r.toFloat(), 12.0f);
+        if (learning == i) { g.setColour (ff::teal); g.drawRoundedRectangle (r.toFloat().reduced (1.0f), 12.0f, 2.0f); }
+        g.setColour (ff::ink);
+        g.setFont (ff::font (30.0f, 0.02f));
+        g.drawText (String::charToString ((juce_wchar) ('A' + i)), r.getX() + 12, r.getY() + 10, 30, 32, Justification::centredLeft);
+        ff::label (g, "FOOTSWITCH " + String::charToString ((juce_wchar) ('A' + i)), { r.getX() + 44, r.getY() + 18, 130, 18 }, Justification::centredLeft, ff::dim, 11.0f);
+        ff::label (g, "TAP", { r.getX() + 12, r.getY() + 48, 100, 14 }, Justification::centredLeft, ff::dim, 10.0f);
+        ff::label (g, "HOLD", { r.getX() + 12, r.getY() + 120, 100, 14 }, Justification::centredLeft, ff::dim, 10.0f);
+        const String listen = proc.pedalsDirect() ? "LISTENS TO CC " + String (s.fsCC[(size_t) i]) + ", ANY CHANNEL"
+                                                  : "LISTENS TO CC " + String (s.fsCC[(size_t) i]) + " ON CHANNEL " + String (s.fsChannel[(size_t) i]);
+        g.setColour (ff::dim);
+        g.setFont (ff::font (11.0f, 0.05f));
+        g.drawFittedText (listen, { r.getX() + 12, r.getY() + 192, 156, 30 }, Justification::topLeft, 2, 1.0f);
+    }
+    struct Combo { const char* name; const char* tap; const char* hold; };
+    const Combo combos[2] = { { "A+B", "BYPASS, PRESS BOTH TOGETHER", nullptr }, { "C+D", "FOOTSWITCHES TO THE NEXT JETSTREAM", "KEEPER" } };
+    for (int i = 0; i < 2; ++i)
+    {
+        auto r = Rectangle<int> (36 + i * 384, 438, 372, 52);
+        g.setColour (ff::bg);
+        g.fillRoundedRectangle (r.toFloat(), 12.0f);
+        g.setColour (ff::ink);
+        g.setFont (ff::font (20.0f, 0.04f));
+        g.drawText (combos[i].name, r.getX() + 14, r.getY(), 56, r.getHeight(), Justification::centredLeft);
+        ff::label (g, "TAP " + dotChar + " " + String (combos[i].tap), { r.getX() + 76, r.getY() + 8, 290, 18 }, Justification::centredLeft, ff::ink, 12.0f);
+        if (combos[i].hold != nullptr)
+            ff::label (g, "HOLD 1 S " + dotChar + " " + String (combos[i].hold), { r.getX() + 76, r.getY() + 26, 290, 18 }, Justification::centredLeft, ff::ink, 12.0f);
+    }
+    wrapText (g, "Any momentary footswitch works. Defaults: CC 20 to 23 on channel 16, or any channel when Jetstream reads the "
+                 "footswitch's USB cable directly. Settings are shared by every Flip Fella plugin on this computer.",
+              { 36, 504, 640, 44 }, 13.0f, ff::dim, 3);
+    ff::label (g, "ORIGINAL MIDI MAP " + dotChar + " CC 80 A, 81 B, 82 BYPASS, 83 HOLD", { 36, 556, 420, 28 }, Justification::centredLeft, ff::dim, 11.0f);
+
+    // expression
+    ff::label (g, "EXPRESSION", { 844, 88, 200, 22 });
+    ff::label (g, "HEEL " + proc.expressionRangeText (false) + " " + dotChar + " TOE " + proc.expressionRangeText (true), { 1026, 120, 200, 16 }, Justification::centredLeft, ff::ink, 11.0f);
+    ff::label (g, "SAVED WITH EACH PRESET", { 1026, 136, 200, 16 }, Justification::centredLeft, ff::dim, 11.0f);
+    ff::label (g, "TARGET", { 844, 160, 200, 16 }, Justification::centredLeft, ff::dim, 11.0f);
+    ff::label (g, "PEDAL POSITION " + String (roundToInt (proc.uiExp.load() * 127.0f)) + " " + dotChar + " HEEL " + String (s.heel) + " " + dotChar + " TOE " + String (s.toe),
+               { 844, 284, 380, 16 }, Justification::centredLeft, ff::dim, 11.0f);
+    wrapText (g, calNote, { 844, 384, 380, 34 }, 13.0f, ff::dim, 2);
+    ff::label (g, "CURVE", { 844, 420, 200, 18 }, Justification::centredLeft, ff::dim, 11.0f);
+    ff::label (g, "SMOOTHING", { 844, 480, 200, 18 }, Justification::centredLeft, ff::dim, 11.0f);
+
+    // bottom strip
+    ff::label (g, "FOOTSWITCH INPUT", { 150, 628, 240, 18 });
+    ff::label (g, proc.footInputStatus().toUpperCase(), { 150, 686, 270, 16 }, Justification::centredLeft, ff::faint, 10.0f);
+    ff::label (g, "KEEPERS ARE TAGGED", { 432, 628, 240, 18 });
+    ff::label (g, proc.lastKeeper() > 0 ? "LAST KEPT: NUMBER " + String (proc.lastKeeper()) : String ("NOTHING KEPT YET"), { 432, 686, 260, 16 }, Justification::centredLeft, ff::faint, 10.0f);
+    wrapText (g, "In Ableton, switch Track, Sync and Remote off for the footswitch input. Jetstream reads it directly, "
+                 "so every copy just works. Notes on a MIDI track still trigger the samplers.", { 940, 632, 284, 90 }, 13.0f, ff::dim, 5);
+}
+
+void PedalPage::resized()
+{
+    back.setBounds (1000, 20, 240, 40);
+    for (int i = 0; i < 4; ++i)
+    {
+        const int x = 36 + i * 192;
+        tapCards[(size_t) i]->setBounds (x + 12, 202, 156, 46);
+        holdCards[(size_t) i]->setBounds (x + 12, 274, 156, 46);
+        learn[(size_t) i]->setBounds (x + 12, 378, 156, 34);
+    }
+    defaults.setBounds (688, 506, 104, 34);
+    mapDown.setBounds (466, 554, 36, 32);
+    mapCard.setBounds (508, 550, 120, 40);
+    mapUp.setBounds (634, 554, 36, 32);
+
+    expTargetCard.setBounds (844, 116, 170, 40);
+    for (int i = 0; i < jet::ExpCount; ++i)
+        targetPills[(size_t) i]->setBounds (844 + (i % 4) * 96, 180 + (i / 4) * 32, 90, 26);
+    expSlider.setBounds (840, 302, 388, 24);
+    calButton.setBounds (844, 334, 380, 44);
+    for (int i = 0; i < 3; ++i)
+    {
+        curvePills[(size_t) i]->setBounds (844 + i * 129, 442, 123, 30);
+        smoothPills[(size_t) i]->setBounds (844 + i * 129, 502, 123, 30);
+    }
+    learnExp.setBounds (844, 546, 186, 34);
+    learnKeep.setBounds (1038, 546, 186, 34);
+
+    pebble.setBounds (36, 628, 92, 92);
+    for (int i = 0; i < 2; ++i)
+    {
+        inputPills[(size_t) i]->setBounds (150 + i * 128, 650, 122, 28);
+        keeperPills[(size_t) i]->setBounds (432 + i * 96, 650, 90, 28);
+    }
+    exportButton.setBounds (714, 644, 170, 44);
+}
+
+void PedalPage::timerCallback()
+{
+    if (! isVisible()) return;
+    auto& s = proc.pedals();
+    deviceText = proc.pedalsDirect() ? "READING YOUR FOOTSWITCH DIRECTLY " + dotChar + " READY"
+                                     : (s.footDevice == "none" ? String ("THROUGH ABLETON ONLY") : String ("NO FOOTSWITCH FOUND, PLUG ONE IN"));
+    const int learning = proc.learningWhat();
+    for (int i = 0; i < 4; ++i)
+    {
+        tapCards[(size_t) i]->setText (proc.footJobTap (i));
+        holdCards[(size_t) i]->setText (proc.footJobHold (i));
+        learn[(size_t) i]->set (learning == i ? "PRESS IT NOW" : "LEARN", {}, learning == i ? fam::col::teal : fam::col::line);
+    }
+    const int t = jlimit (0, jet::ExpCount - 1, (int) std::lround (proc.get ("expTarget")));
+    expTargetCard.setText (jet::expTargetNames()[(size_t) t]);
+    for (int i = 0; i < jet::ExpCount; ++i) targetPills[(size_t) i]->set (jet::expTargetNames()[(size_t) i], i == t, 10.0f);
+    if (! expSlider.isMouseButtonDown()) expSlider.setValue (proc.uiExp.load());
+    calButton.set (proc.isCalibrating() ? "HEEL DOWN, THEN ROCK TO TOE" : "CALIBRATE HEEL AND TOE", {}, proc.isCalibrating() ? fam::col::teal : fam::col::line);
+    calNote = proc.isCalibrating() ? "Listening for six seconds. Rock the pedal all the way, both ways."
+                                   : "Fixes a pedal that doesn't reach 0 or 127, or one that runs backwards.";
+    static const char* curves[3] = { "LINEAR", "SLOW START", "FAST START" };
+    static const char* smooths[3] = { "OFF", "LOW", "HIGH" };
+    for (int i = 0; i < 3; ++i)
+    {
+        curvePills[(size_t) i]->set (curves[i], s.curve == i, 11.0f);
+        smoothPills[(size_t) i]->set (smooths[i], s.expSmooth == i, 11.0f);
+    }
+    learnExp.set (learning == JetstreamProcessor::LearnExpression ? "MOVE THE PEDAL NOW" : "LEARN EXPRESSION " + dotChar + " CC " + String (s.expCC), {},
+                  learning == JetstreamProcessor::LearnExpression ? fam::col::teal : fam::col::line);
+    learnKeep.set (learning == JetstreamProcessor::LearnKeeper ? "PRESS IT NOW" : (s.keeperCC >= 0 ? "KEEPER SWITCH " + dotChar + " CC " + String (s.keeperCC) : String ("LEARN A KEEPER SWITCH")), {},
+                   learning == JetstreamProcessor::LearnKeeper ? fam::col::teal : fam::col::line);
+    mapCard.setText (s.pedalMapChannel == 0 ? "OFF" : "CHANNEL " + String (s.pedalMapChannel), s.pedalMapChannel == 0 ? fam::col::dim : fam::col::ink);
+    inputPills[0]->set ("READ DIRECTLY", s.footDevice != "none", 11.0f);
+    inputPills[1]->set ("ABLETON ONLY", s.footDevice == "none", 11.0f);
+    keeperPills[0]->set ("LIVE", s.keeperLive, 11.0f);
+    keeperPills[1]->set ("STUDIO", ! s.keeperLive, 11.0f);
+    if (proc.lastKeeper() != lastKept) { lastKept = proc.lastKeeper(); pebble.react (fam::Pebble::Kept); }
     repaint();
 }
 
-void PresetToggle::mouseUp (const MouseEvent&)
-{
-    if (pressedCell >= 0 && ! saved)
-        setParam (proc.apvts.getParameter (ParamIDs::presetSlot), (float) pressedCell);
-    pressedCell = -1;
-    repaint();
-}
 
 BypassButton::BypassButton (JetstreamProcessor& p) : proc (p)
 {
@@ -765,6 +1044,9 @@ void MemoryStrip::update (double t, double dt)
 
     const int caps = eng.uiCaptures.load();
     if (caps != lastCaptures) { hop = 1.0f; lastCaptures = caps; }
+    // a footswitch press or a Keeper gets a hop too
+    const int fp = proc.uiFootPulse.load(), kp = proc.uiKeepPulse.load();
+    if (fp != lastFoot || kp != lastKeep) { hop = 1.0f; lastFoot = fp; lastKeep = kp; }
     hop *= (float) std::exp (-dt / 0.12);
 
     const float lookTarget = envA > envB + 0.05f ? -0.8f : (envB > envA + 0.05f ? 0.8f : 0.0f);
@@ -782,6 +1064,7 @@ void MemoryStrip::update (double t, double dt)
     const bool glitchB = roundToInt (proc.apvts.getRawParameterValue (ParamIDs::voice)->load()) == jet::VGlitchB;
     status = String (filled) + " OF 6";
     detail = held ? "HELD" : (writing >= 0 ? "RECORDING" : (glitchB ? "SAVES WITH SET" : "GLITCH B ONLY"));
+    message = t - proc.uiMessageAt < 2.5 ? proc.uiMessage : String();
     repaint();
 }
 
@@ -881,6 +1164,14 @@ void MemoryStrip::paint (Graphics& g)
     ff::label (g, status, info.removeFromTop (30), Justification::centredLeft, ff::ink, 22.0f);
     ff::label (g, detail, info.removeFromTop (18));
 
+    // what the last footswitch press did, for a moment
+    if (message.isNotEmpty())
+    {
+        g.setColour (ff::teal);
+        g.setFont (ff::font (12.0f, 0.06f));
+        g.drawFittedText (message, { 868, 18, 118, getHeight() - 36 }, Justification::centredLeft, 3, 1.0f);
+    }
+
     const auto& eng = proc.getEngine();
     const bool glitchB = roundToInt (proc.apvts.getRawParameterValue (ParamIDs::voice)->load()) == jet::VGlitchB;
     const int sel = eng.uiSelected.load();
@@ -952,7 +1243,9 @@ JetstreamEditor::JetstreamEditor (JetstreamProcessor& p)
       width (p.apvts, ParamIDs::width, "Width"),
       air (p.apvts, ParamIDs::air, "Air"),
       strip (p),
-      bypass (p)
+      bypass (p),
+      feet (p, [this] { pedalPage.setVisible (true); pedalPage.toFront (false); }),
+      pedalPage (p, [this] { pedalPage.setVisible (false); })
 {
     setLookAndFeel (&lnf);
     lnf.setColour (TextButton::buttonColourId, ff::bg);
@@ -965,10 +1258,11 @@ JetstreamEditor::JetstreamEditor (JetstreamProcessor& p)
     for (auto* c : std::initializer_list<Component*> { &inputMode, &learn, &sensitivity, &presets, &triggerCard, &trigger, &fsMode,
                                                        &envShape, &envTime, &buttonA, &buttonB, &groupCard, &variantCard, &voiceDial,
                                                        &lights, &dimension, &lfoDepth, &lfoRate, &lfoShape, &dimSource, &sync, &recDim,
-                                                       &recDrive, &autoLevel, &drive, &tone, &dry, &master, &width, &air, &strip, &bypass })
+                                                       &recDrive, &autoLevel, &drive, &tone, &dry, &master, &width, &air, &strip, &bypass, &feet })
         addAndMakeVisible (c);
+    addChildComponent (pedalPage);
 
-    setSize (1260, 648);
+    setSize (kWidth, kHeight);
     lastTick = Time::getMillisecondCounterHiRes() * 0.001;
     startTimerHz (60);
 }
@@ -991,9 +1285,6 @@ void JetstreamEditor::paint (Graphics& g)
     g.setColour (ff::ink);
     g.setFont (ff::font (26.0f, 0.04f));
     g.drawText ("JETSTREAM", 20, 20, 150, 40, Justification::centredLeft, false);
-    ff::label (g, "SAMPLED SUSTAIN, SILKY STEREO", { 172, 20, 280, 40 });
-    ff::label (g, "INPUT", { 488, 20, 50, 40 });
-    ff::label (g, "MIDI + AUDIO", { 996, 20, 96, 40 });
 
     section (g, { 20, 76, 270, 440 });
     section (g, { 310, 76, 350, 440 });
@@ -1010,10 +1301,10 @@ void JetstreamEditor::paint (Graphics& g)
 void JetstreamEditor::resized()
 {
     // header
-    inputMode.setBounds (540, 24, 210, 32);
-    learn.setBounds (762, 24, 100, 32);
-    sensitivity.setBounds (872, 22, 116, 36);
-    presets.setBounds (1100, 24, 140, 40);
+    presets.setBounds (176, 20, 520, 40);
+    inputMode.setBounds (720, 24, 210, 32);
+    learn.setBounds (940, 24, 100, 32);
+    sensitivity.setBounds (1050, 22, 190, 36);
 
     // samplers
     triggerCard.setBounds (36, 120, 238, 72);
@@ -1051,6 +1342,8 @@ void JetstreamEditor::resized()
 
     strip.setBounds (20, 532, 1220, 96);
     bypass.setBounds (1002, 548, 220, 64);
+    feet.setBounds (20, 644, 1220, 144);
+    pedalPage.setBounds (getLocalBounds());
 }
 
 void JetstreamEditor::timerCallback()
@@ -1069,19 +1362,11 @@ void JetstreamEditor::timerCallback()
     triggerCard.setValue (triggerNames[jlimit (0, 2, roundToInt (s.getRawParameterValue (ParamIDs::trigger)->load()))]);
 
     const int voice = jlimit (0, jet::kNumVoices - 1, roundToInt (s.getRawParameterValue (ParamIDs::voice)->load()));
-    const int slot = roundToInt (s.getRawParameterValue (ParamIDs::presetSlot)->load());
+
     static const char* groupNames[] = { "BLUR", "BLUR", "BLUR", "BLUR", "SYNTH", "SYNTH", "GLITCH", "GLITCH", "SWELL", "SWELL" };
     static const char* variantNames[] = { "0", "-1", "+1", "\xc2\xb1" "1", "A", "B", "A", "B", "A", "B" };
-    if (slot != 1)
-    {
-        groupCard.setValue ("USER");
-        variantCard.setValue (slot == 0 ? "A" : "B");
-    }
-    else
-    {
-        groupCard.setValue (groupNames[voice]);
-        variantCard.setValue (String::fromUTF8 (variantNames[voice]));
-    }
+    groupCard.setValue (groupNames[voice]);
+    variantCard.setValue (String::fromUTF8 (variantNames[voice]));
 
     // What Dimension does in this voice
     const int group = jet::groupOf (voice);
@@ -1107,7 +1392,7 @@ void JetstreamEditor::timerCallback()
     dimension.setModulated (dimEff, dimMoving);
 
     // Tempo-synced rate reads as a note length
-    if (proc.currentBpm() > 0.0f)
+    if (proc.uiBpm.load() > 0.0f)
         lfoRate.setValueText (names::divisions[names::divisionIndex (s.getRawParameterValue (ParamIDs::lfoRate)->load())]);
     else
         lfoRate.setValueText ({});

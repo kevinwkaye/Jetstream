@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(Jetstream VERSION 0.1.0 LANGUAGES C CXX)
+project(Jetstream VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,7 +16,8 @@ endif()
 # ---------------------------------------------------------------------------
 set(JETSTREAM_JUCE_PATH "" CACHE PATH "Path to a local JUCE checkout (optional)")
 option(JETSTREAM_BUILD_PLUGIN "Build the plugin (needs JUCE)" ON)
-option(JETSTREAM_BUILD_TESTS "Build the offline render test" ON)
+option(JETSTREAM_BUILD_TESTS "Build the engine tests and CPU report" ON)
+option(JETSTREAM_SNAPSHOT "Build the UI snapshot tool (developer only)" OFF)
 
 if(JETSTREAM_BUILD_PLUGIN)
     if(JETSTREAM_JUCE_PATH)
@@ -57,7 +58,9 @@ if(JETSTREAM_BUILD_PLUGIN)
 
     target_sources(Jetstream PRIVATE
         Source/PluginProcessor.cpp
-        Source/PluginEditor.cpp)
+        Source/PluginEditor.cpp
+        Source/PedalControl.cpp
+        Source/Keeper.cpp)
 
     target_include_directories(Jetstream PRIVATE Source Source/engine)
 
@@ -71,6 +74,8 @@ if(JETSTREAM_BUILD_PLUGIN)
         PRIVATE
             JetstreamData
             juce::juce_audio_utils
+            juce::juce_audio_devices
+            juce::juce_audio_formats
             juce::juce_dsp
         PUBLIC
             juce::juce_recommended_config_flags
@@ -79,9 +84,28 @@ if(JETSTREAM_BUILD_PLUGIN)
 endif()
 
 # ---------------------------------------------------------------------------
-# Offline engine test (no JUCE needed): renders test audio through every voice
+# Engine tests and CPU report (no JUCE needed)
 # ---------------------------------------------------------------------------
 if(JETSTREAM_BUILD_TESTS)
-    add_executable(jetstream_render_test Tests/RenderTest.cpp)
-    target_include_directories(jetstream_render_test PRIVATE Source/engine)
+    add_executable(engine_test tests/engine_test.cpp)
+    target_include_directories(engine_test PRIVATE Source/engine)
+    add_executable(cpu_report tests/cpu_report.cpp)
+endif()
+
+# Plugin-level footswitch, preset and state checks
+if(JETSTREAM_BUILD_PLUGIN AND JETSTREAM_BUILD_TESTS)
+    juce_add_console_app(plugin_test PRODUCT_NAME "plugin_test")
+    target_sources(plugin_test PRIVATE tests/plugin_test.cpp Source/PluginProcessor.cpp Source/PluginEditor.cpp Source/PedalControl.cpp Source/Keeper.cpp)
+    target_include_directories(plugin_test PRIVATE Source Source/engine)
+    target_compile_definitions(plugin_test PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_STANDALONE_APPLICATION=1)
+    target_link_libraries(plugin_test PRIVATE JetstreamData juce::juce_audio_utils juce::juce_audio_devices juce::juce_audio_formats juce::juce_dsp juce::juce_recommended_config_flags)
+endif()
+
+# Developer tool: renders the editor to PNGs (needs a display, not built in CI)
+if(JETSTREAM_BUILD_PLUGIN AND JETSTREAM_SNAPSHOT)
+    juce_add_console_app(JetstreamSnapshot PRODUCT_NAME "JetstreamSnapshot")
+    target_sources(JetstreamSnapshot PRIVATE tests/snapshot.cpp Source/PluginProcessor.cpp Source/PluginEditor.cpp Source/PedalControl.cpp Source/Keeper.cpp)
+    target_include_directories(JetstreamSnapshot PRIVATE Source Source/engine)
+    target_compile_definitions(JetstreamSnapshot PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_STANDALONE_APPLICATION=1 JUCE_MODAL_LOOPS_PERMITTED=1)
+    target_link_libraries(JetstreamSnapshot PRIVATE JetstreamData juce::juce_audio_utils juce::juce_audio_devices juce::juce_audio_formats juce::juce_dsp juce::juce_recommended_config_flags)
 endif()

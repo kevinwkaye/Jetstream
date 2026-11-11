@@ -135,6 +135,11 @@ public:
         mode = Mode::Idle;
     }
 
+    // Footswitch held in Poly or Mono: the sound stops moving and rings where it is
+    // (after finishing its attack) until the footswitch is let go.
+    void setSustain (bool on) { sustained = on; }
+    bool isSustained() const { return sustained && isActive(); }
+
     void setRepeatRate (float rateHz) { if (mode == Mode::Repeat) inc = std::max (0.05f, rateHz) / fs; }
     void setShape (int shp) { shape = shp; }
 
@@ -151,7 +156,8 @@ public:
             case Mode::Idle: break;
             case Mode::OneShot:
                 v = value (phase);
-                phase += inc;
+                if (! (sustained && phase >= peak))
+                    phase += inc;
                 if (phase >= 1.0f) { mode = Mode::Idle; phase = 1.0f; v = 0.0f; }
                 break;
             case Mode::Sustain:
@@ -159,6 +165,10 @@ public:
                 {
                     if (phase < peak) { v = value (phase); phase = std::min (peak, phase + inc); }
                     else v = shape == ShapeRandom ? randomValue() : 1.0f;
+                }
+                else if (sustained)
+                {
+                    v = std::min (value (phase), releaseFrom);
                 }
                 else
                 {
@@ -174,7 +184,8 @@ public:
                 break;
             case Mode::Repeat:
                 v = value (phase);
-                phase += inc;
+                if (! sustained)
+                    phase += inc;
                 if (phase >= 1.0f) phase -= 1.0f;
                 break;
         }
@@ -228,7 +239,7 @@ private:
     Mode mode = Mode::Idle;
     int shape = ShapeSwell;
     float dur = 1.0f, inc = 0.0f, phase = 0.0f, edge = 0.01f, peak = 0.5f;
-    bool holding = false;
+    bool holding = false, sustained = false;
     float releaseFrom = 1.0f, current = 0.0f;
     float floorLevel = 0.0f, floorStep = 0.0f;
     float randRate = 4.0f, randCount = 0.0f, randTarget = 1.0f;

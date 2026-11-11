@@ -29,6 +29,23 @@ inline float softClip (float x)
     return s * (0.85f + 0.15f * std::tanh ((ax - 0.85f) / 0.15f));
 }
 
+// The output ceiling: untouched below -2.5 dBFS, never above -1 dBFS.
+inline float softCeiling (float x)
+{
+    constexpr float knee = 0.75f, room = 0.141f; // 0.75 + 0.141 = 0.891 (-1 dBFS)
+    const float ax = std::fabs (x);
+    if (ax <= knee) return x;
+    const float s = x > 0.0f ? 1.0f : -1.0f;
+    return s * (knee + room * std::tanh ((ax - knee) / room));
+}
+
+// Raised cosine 0..1, for fades with no corners
+inline float raisedCos (float t)
+{
+    t = std::min (std::max (t, 0.0f), 1.0f);
+    return 0.5f - 0.5f * std::cos (3.14159265358979f * t);
+}
+
 struct Stereo
 {
     float l = 0.0f, r = 0.0f;
@@ -187,5 +204,139 @@ private:
     int size = 0;
     std::vector<std::complex<float>> tw;
     std::vector<int> rev;
+};
+// 2x oversampling with a 47-tap Kaiser halfband filter (stopband about 80 dB down).
+// Used around the drive and the Swell B fuzz so their harmonics don't fold back.
+// Adds kLatency input samples of delay.
+class Oversampler2x
+{
+public:
+    static constexpr int kSide = 12;            // non-zero taps each side
+    static constexpr int kLatency = 2 * kSide - 1; // up + down, in input samples
+
+    Oversampler2x()
+    {
+        auto bessel0 = [] (double x)
+        {
+            double sum = 1.0, term = 1.0;
+            for (int k = 1; k < 30; ++k) { term *= (x / (2.0 * k)) * (x / (2.0 * k)); sum += term; }
+            return sum;
+        };
+        const double beta = 8.0, half = 2.0 * kSide; // taps run -(2*kSide-1)..(2*kSide-1)
+        double total = 0.0;
+        for (int i = 0; i < kSide; ++i)
+        {
+            const double k = 2.0 * i + 1.0;
+            const double sinc = std::sin (3.14159265358979 * k * 0.5) / (3.14159265358979 * k * 0.5);
+            const double r = k / half;
+            const double w = bessel0 (beta * std::sqrt (std::max (0.0, 1.0 - r * r))) / bessel0 (beta);
+            c[i] = (float) (0.5 * sinc * w);
+            total += 2.0 * c[i];
+        }
+        const float norm = (float) (0.5 / total); // DC gain exactly 1
+        for (float& v : c) v *= norm;
+        reset();
+    }
+
+    void reset()
+    {
+        std::fill (std::begin (up), std::end (up), 0.0f);
+        std::fill (std::begin (dn), std::end (dn), 0.0f);
+        upPos = dnPos = 0;
+    }
+
+    // One input sample -> two samples at twice the rate
+    void upsample (float x, float& a, float& b)
+    {
+        up[upPos] = x;
+        up[upPos + kHist] = x;
+        const float* h = up + upPos + 1; // h[kHist-1] is the newest sample
+        const int centre = kHist - 1 - kSide;
+        a = h[centre];
+        float acc = 0.0f;
+        for (int i = 0; i < kSide; ++i)
+            acc += c[i] * (h[centre - i] + h[centre + 1 + i]);
+        b = 2.0f * acc;
+        upPos = (upPos + 1) % kHist;
+    }
+
+    // Two samples at twice the rate -> one output sample
+    float downsample (float a, float b)
+    {
+        dn[dnPos] = a; dn[dnPos + kDown] = a;
+        dnPos = (dnPos + 1) % kDown;
+        dn[dnPos] = b; dn[dnPos + kDown] = b;
+        dnPos = (dnPos + 1) % kDown;
+        const float* h = dn + dnPos; // h[kDown-1] newest
+        const int centre = kDown - 1 - (2 * kSide - 1);
+        float acc = 0.5f * h[centre];
+        for (int i = 0; i < kSide; ++i)
+            acc += c[i] * (h[centre - (2 * i + 1)] + h[centre + (2 * i + 1)]);
+        return acc;
+    }
+
+private:
+    static constexpr int kHist = 2 * kSide + 1;
+    static constexpr int kDown = 4 * kSide;
+    float c[kSide];
+    float up[2 * kHist];
+    float dn[2 * kDown];
+    int upPos = 0, dnPos = 0;
+};
+// 4x oversampling: two halfband stages. Latency rounds to a whole input sample.
+class Oversampler4x
+{
+public:
+    static constexpr int kLatency = 35; // 23 at 1x, (23 + 1) / 2 at 2x
+    void reset() { a.reset(); b.reset(); dB.reset(); dA.reset(); held = 0.0f; }
+
+    template <typename Fn>
+    float process (float x, Fn&& shape)
+    {
+        float u0, u1;
+        a.upsample (x, u0, u1);
+        // one sample of delay at 2x keeps the total latency a whole number of input samples
+        const float d = held; held = u1; u1 = u0; u0 = d;
+        float q[4];
+        b.upsample (u0, q[0], q[1]);
+        b.upsample (u1, q[2], q[3]);
+        for (float& v : q) v = shape (v);
+        const float d0 = dB.downsample (q[0], q[1]);
+        const float d1 = dB.downsample (q[2], q[3]);
+        return dA.downsample (d0, d1);
+    }
+
+private:
+    Oversampler2x a, b, dB, dA;
+    float held = 0.0f;
+};
+// RBJ biquad (transposed direct form II)
+struct Biquad
+{
+    float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
+    void set (bool highPass, float fc, float q, float fs)
+    {
+        const float w = kTwoPi * clampf (fc, 5.0f, fs * 0.45f) / fs, cw = std::cos (w), al = std::sin (w) / (2.0f * q);
+        const float a0 = 1.0f + al;
+        if (highPass) { b0 = (1.0f + cw) * 0.5f / a0; b1 = -(1.0f + cw) / a0; }
+        else          { b0 = (1.0f - cw) * 0.5f / a0; b1 = (1.0f - cw) / a0; }
+        b2 = b0; a1 = -2.0f * cw / a0; a2 = (1.0f - al) / a0;
+    }
+    float process (float x)
+    {
+        const float y = b0 * x + z1;
+        z1 = b1 * x - a1 * y + z2;
+        z2 = b2 * x - a2 * y;
+        return y;
+    }
+    void reset() { z1 = z2 = 0; }
+};
+
+// Linkwitz-Riley 4th order (two Butterworth stages): flat when the bands are summed
+struct LR4
+{
+    Biquad s[2];
+    void set (bool highPass, float fc, float fs) { for (auto& b : s) { b.set (highPass, fc, 0.70710678f, fs); b.reset(); } }
+    float process (float x) { return s[1].process (s[0].process (x)); }
 };
 } // namespace jet

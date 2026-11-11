@@ -9,20 +9,54 @@ permissions:
   contents: write
 
 jobs:
+  # The DSP core on Linux ARM64: sound tests and the CPU report
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the engine tests
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -ISource/engine tests/engine_test.cpp -o engine_test
+          g++ -std=c++17 -O2 tests/cpu_report.cpp -o cpu_report
+
+      - name: Sound and behaviour tests
+        run: ./engine_test
+
+      - name: CPU per instance at 48 kHz
+        run: |
+          echo "### CPU per instance, Linux ARM64, 48 kHz" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ./cpu_report | tee -a $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
   windows:
     runs-on: windows-latest
+    needs: linux-arm64
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -S . -B build -DJETSTREAM_BUILD_TESTS=ON
+        run: cmake -S . -B build -A x64 -DJETSTREAM_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build --config Release --parallel 4
 
-      - name: Engine render test
-        run: build\Release\jetstream_render_test.exe
+      - name: Sound and behaviour tests
+        run: build\Release\engine_test.exe
+
+      - name: Footswitch, preset and state tests
+        run: build\plugin_test_artefacts\Release\plugin_test.exe
+
+      - name: CPU per instance at 48 kHz
+        shell: bash
+        run: |
+          build/Release/cpu_report.exe | tee cpu-report.txt
+          echo "### CPU per instance, Windows x64, 48 kHz" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat cpu-report.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Validate with pluginval
         id: pluginval
@@ -46,6 +80,8 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item -Recurse build\Jetstream_artefacts\Release\VST3\Jetstream.vst3 dist\
           Copy-Item build\Jetstream_artefacts\Release\Standalone\Jetstream.exe dist\Jetstream-standalone.exe
+          Copy-Item README.md dist\
+          Copy-Item cpu-report.txt dist\
           if (Test-Path pluginval-report.txt) { Copy-Item pluginval-report.txt dist\ }
 
       # Artifact storage counts against the account quota, so the finished

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "PluginProcessor.h"
+#include "Params.h"
+#include "UI/Family.h"
 #include <juce_audio_utils/juce_audio_utils.h>
 
 // Flip Fella palette, shared across all of Kevin's builds.
@@ -143,8 +145,9 @@ private:
     int stopAt (juce::Point<float>) const;
     void pick (int stop);
     JetstreamProcessor& proc;
-    juce::RangedAudioParameter *voiceParam = nullptr, *slotParam = nullptr;
-    int dragStop = -1;
+    juce::RangedAudioParameter* voiceParam = nullptr;
+    int dragStop = -1, userLit = 1;
+    double downAt = 0.0, userLitUntil = 0.0;
     float dragStart = 0.0f;
 };
 
@@ -158,10 +161,8 @@ public:
     void mouseUp (const juce::MouseEvent&) override;
 
 private:
-    void set (bool);
     JetstreamProcessor& proc;
     int channel;
-    juce::RangedAudioParameter* param = nullptr;
     bool pressed = false;
 };
 
@@ -201,23 +202,64 @@ private:
     JetstreamProcessor& proc;
 };
 
-// A / LIVE / B, like Murmur. Hold A or B to save into it.
-class PresetToggle : public juce::Component, private juce::Timer
+// The preset strip: previous, the preset's name on a flip card, next, SAVE.
+// User A and B live on the Voice dial: tap to recall, hold to store.
+class PresetStrip : public juce::Component, private juce::Timer
 {
 public:
-    PresetToggle (JetstreamProcessor&);
+    explicit PresetStrip (JetstreamProcessor&);
+    void resized() override;
     void paint (juce::Graphics&) override;
-    void mouseDown (const juce::MouseEvent&) override;
-    void mouseUp (const juce::MouseEvent&) override;
 
 private:
     void timerCallback() override;
-    juce::Rectangle<float> cell (int i) const;
     JetstreamProcessor& proc;
-    int pressedCell = -1;
-    double downAt = 0, savedFlashUntil = 0;
-    int savedCell = -1;
-    bool saved = false;
+    fam::BigButton prev, next;
+    fam::FlipCard card { 18.0f };
+    fam::PillButton save;
+    float savedFlash = 0.0f;
+};
+
+// The four footswitches, Keeper, the expression bar, the preset tip and the Pedal page link
+class FootStrip : public juce::Component, private juce::Timer
+{
+public:
+    FootStrip (JetstreamProcessor&, std::function<void()> openPedalPage);
+    void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void resized() override;
+
+private:
+    void timerCallback() override;
+    JetstreamProcessor& proc;
+    std::vector<std::unique_ptr<fam::FootButton>> feet;
+    fam::BigButton keeper;
+    fam::FlipCard expCard { 16.0f };
+    fam::ThinSlider expSlider;
+    fam::LinkButton pedalLink;
+};
+
+// Footswitch and expression setup, shared by every Flip Fella plugin
+class PedalPage : public juce::Component, private juce::Timer
+{
+public:
+    PedalPage (JetstreamProcessor&, std::function<void()> close);
+    void paint (juce::Graphics&) override;
+    void resized() override;
+
+private:
+    void timerCallback() override;
+    JetstreamProcessor& proc;
+    fam::LinkButton back;
+    fam::FlipCard expTargetCard { 18.0f }, mapCard { 16.0f };
+    fam::ThinSlider expSlider;
+    fam::BigButton calButton, learnExp, defaults, exportButton, mapDown, mapUp, learnKeep;
+    fam::Pebble pebble;
+    std::vector<std::unique_ptr<fam::FlipCard>> tapCards, holdCards;
+    std::vector<std::unique_ptr<fam::BigButton>> learn;
+    std::vector<std::unique_ptr<fam::PillButton>> targetPills, curvePills, smoothPills, inputPills, keeperPills;
+    juce::String deviceText, calNote;
+    int lastKept = 0;
 };
 
 class BypassButton : public juce::Component
@@ -252,9 +294,9 @@ private:
     float level = 0, envA = 0, envB = 0, look = 0, mouth = 0, hop = 0;
     bool asleep = false, blinking = false, held = false, bypassed = false;
     double lastSound = 0, nextBlink = 2.0, blinkUntil = 0, now = 0;
-    int lastCaptures = 0, filled = 0;
+    int lastCaptures = 0, filled = 0, lastFoot = 0, lastKeep = 0;
     float flash[6] = {};
-    juce::String status, detail;
+    juce::String status, detail, message;
 };
 } // namespace ui
 
@@ -279,7 +321,7 @@ private:
     ui::Pills inputMode;
     ui::LearnButton learn;
     ui::LabelledSlider sensitivity;
-    ui::PresetToggle presets;
+    ui::PresetStrip presets;
 
     // samplers
     ui::FlipCard triggerCard;
@@ -305,8 +347,11 @@ private:
 
     ui::MemoryStrip strip;
     ui::BypassButton bypass;
+    ui::FootStrip feet;
+    ui::PedalPage pedalPage;
 
     juce::String dimMeaning;
+    static constexpr int kWidth = 1260, kHeight = 800;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (JetstreamEditor)
 };
